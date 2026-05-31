@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Full-Wave Rectifier Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #f4f3ee;
+    --panel: #ffffff;
+    --ink: #1a1a1a;
+    --ink-2: #5a5a58;
+    --ink-3: #8a8a86;
+    --rule: #d8d6cc;
+    --rule-2: #ecebe2;
+    --accent: #c14a1a;
+    --vs: #2a5fa6;     /* source */
+    --vo: #c97b1a;     /* output voltage */
+    --io: #1f7a4a;     /* output current */
+    --grid: #e6e4d8;
+    --grid-axis: #b8b6a8;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script>
+// Numerical simulation of a single-phase fully-controlled full-wave bridge rectifier.
+// Loads: 'R' (resistive), 'RL' (inductive), 'RLE' (with back-EMF, e.g. motor / battery).
+//
+// Circuit:
+//   vs(t) = Vm * sin(ωt)
+//   When a thyristor pair conducts, vo = |vs|; the load equation is
+//       L * di/dt + R * i + E = vo
+//   Conduction starts at firing angle α each half cycle (T1T2 at α, T3T4 at π+α).
+//   In a fully-controlled bridge, a pair conducts until either:
+//     (a) the next pair is fired and forces commutation, OR
+//     (b) the current naturally reaches zero (discontinuous conduction).
+//
+// The simulator integrates with RK4 over one period, iterating the initial current
+// until steady-state (i(0) = i(T)) is reached.
+
+(function () {
+  function simulate(params) {
+    const {
+      Vm = 100,        // peak source voltage [V]
+      f = 50,          // line frequency [Hz]
+      alphaDeg = 30,   // firing angle [°]
+      load = 'RL',     // 'R' | 'RL' | 'RLE'
+      R = 10,          // resistance [Ω]
+      L = 0.05,        // inductance [H]   (ignored if load === 'R')
+      E = 0,           // back-EMF [V]     (ignored unless load === 'RLE')
+      N = 2000,        // samples per period
+    } = params;
+
+    const omega = 2 * Math.PI * f;
+    const T = 1 / f;
+    const dt = T / N;
+    const alpha = (alphaDeg * Math.PI) / 180;
+
+    const Leff = load === 'R' ? 0 : Math.max(L, 0);
+    const Eeff = load === 'RLE' ? E : 0;
+
+    const vs = (t) => Vm * Math.sin(omega * t);
+
+    // Firing instants within one period (T): α/ω and (π+α)/ω
+    const tf1 = alpha / omega;
+    const tf2 = (Math.PI + alpha) / omega;
+
+    // For a given t, compute |vs| with sign of the pair that *was last fired*.
+    // We track conduction state as: gateOn (boolean) + sign (+1 or -1)
+    // Pair sign: T1T2 conducts on positive half (sign +1), T3T4 on negative half (sign -1).
+    // vo = sign * vs when conducting (which equals |vs| during natural conduction window).
+    // When inductive load forces conduction past π, vs goes negative; vo = +vs (negative!),
+    // i.e. output voltage can go negative briefly. That's correct for a bridge.
+
+    // We'll run the simulation with state (i, gateOn, sign) sampled at dt intervals.
+    // To find steady-state initial current i0, iterate the period a few times.
+
+    function di_dt(i, vo) {
+      if (load === 'R') {
+        // Pure resistive: there's no L term; this function isn't used (we set i directly).
+        return 0;
+      }
+      return (vo - R * i - Eeff) / Leff;
+    }
+
+    function runOnePeriod(i0) {
+      const samples = new Array(N + 1);
+      let i = i0;
+      let sign = +1;            // most recently fired pair direction
+      let conducting = false;   // is any pair currently on?
+      // We start at t=0. The most recently fired pair before t=0 is T3T4 (sign -1)
+      // at t = tf2 - T (i.e. firing in the previous period). For steady state this is fine.
+      // To bootstrap correctly: assume at t=0 we're in the tail of T3T4 conduction.
+      sign = -1;
+      conducting = i0 !== 0 || alpha === 0; // assume on if any current
+
+      for (let k = 0; k <= N; k++) {
+        const t = k * dt;
+
+        // --- Fire events: if t crosses a firing instant, switch pair ---
+        // We check at the start of each step.
+        const tmod = t; // already within [0, T]
+        // Fire T1T2 at tf1:
+        if (
+          (k > 0 && (k - 1) * dt < tf1 && t >= tf1) ||
+          (k === 0 && tf1 === 0)
+        ) {
+          sign = +1;
+          conducting = true;
+        }
+        // Fire T3T4 at tf2:
+        if (k > 0 && (k - 1) * dt < tf2 && t >= tf2) {
+          sign = -1;
+          conducting = true;
+        }
+
+        // Compute vo for this instant (before integrating)
+        const vsNow = vs(t);
+        let voNow = conducting ? sign * vsNow : Eeff; // when off, vo "floats"; we plot E for RLE, 0 otherwise
+        if (!conducting && load !== 'RLE') voNow = 0;
+
+        // If R-only load: current follows vo/R instantly while conducting.
+        if (load === 'R') {
+          if (conducting) {
+            // Natural turn-off when sign*vs goes <= 0 (current would reverse, but thyristor blocks)
+            if (sign * vsNow <= 0) {
+              conducting = false;
+              i = 0;
+              voNow = 0;
+            } else {
+              i = vsNow * sign / R;
+            }
+          } else {
+            i = 0;
+          }
+          samples[k] = { t, vs: vsNow, vo: voNow, io: i };
+          continue;
+        }
+
+        // RL / RLE: integrate with RK4 across [t, t+dt] assuming conducting state holds.
+        samples[k] = { t, vs: vsNow, vo: voNow, io: i };
+
+        if (k === N) break;
+
+        if (conducting) {
+          const vAt = (tt) => {
+            const v = Vm * Math.sin(omega * tt);
+            return sign * v;
+          };
+          const f1 = di_dt(i, vAt(t));
+          const f2 = di_dt(i + 0.5 * dt * f1, vAt(t + 0.5 * dt));
+          const f3 = di_dt(i + 0.5 * dt * f2, vAt(t + 0.5 * dt));
+          const f4 = di_dt(i + dt * f3, vAt(t + dt));
+          let iNext = i + (dt / 6) * (f1 + 2 * f2 + 2 * f3 + f4);
+
+          // If current would go negative -> natural turn-off at zero-crossing
+          if (iNext < 0) {
+            iNext = 0;
+            conducting = false;
+          }
+          i = iNext;
+        } else {
+          // Off: i stays 0 (for RLE we assume thyristors block any reverse current too)
+          i = 0;
+        }
+      }
+
+      return samples;
+    }
+
+    // --- Steady-state: iterate periods until i(0) ≈ i(T) ---
+    let i0 = 0;
+    let samples = null;
+    for (let iter = 0; iter < 40; iter++) {
+      samples = runOnePeriod(i0);
+      const iEnd = samples[N].io;
+      if (Math.abs(iEnd - i0) < 1e-5) break;
+      i0 = iEnd;
+    }
+
+    // --- Aggregate metrics ---
+    let voSum = 0, voSqSum = 0;
+    let ioSum = 0, ioSqSum = 0;
+    let conducting = 0;
+    for (let k = 0; k < N; k++) {
+      const s = samples[k];
+      voSum += s.vo;
+      voSqSum += s.vo * s.vo;
+      ioSum += s.io;
+      ioSqSum += s.io * s.io;
+      if (Math.abs(s.io) > 1e-6) conducting++;
+    }
+    const Vavg = voSum / N;
+    const Vrms = Math.sqrt(voSqSum / N);
+    const Iavg = ioSum / N;
+    const Irms = Math.sqrt(ioSqSum / N);
+    const conductionFrac = conducting / N; // fraction of period current flows
+    // For a bridge there are two conduction intervals per period -> conduction angle per half:
+    const conductionAngleDeg = conductionFrac * 360 / 2;
+    const ripple = Vavg !== 0 ? Math.sqrt(Math.max(Vrms * Vrms - Vavg * Vavg, 0)) / Vavg : 0;
+
+    // Theoretical (continuous-conduction) average for fully controlled bridge:
+    //   Vavg_cc = (2 * Vm / π) * cos(α)
+    const VavgTheory = (2 * Vm / Math.PI) * Math.cos(alpha);
+
+    return {
+      samples,
+      params: { Vm, f, alphaDeg, load, R, L, E, N, T, omega, alpha },
+      metrics: {
+        Vavg, Vrms, Iavg, Irms,
+        conductionAngleDeg,
+        ripplePct: ripple * 100,
+        VavgTheory,
+      },
+    };
+  }
+
+  window.RectifierSim = { simulate };
+})();
+
+</script>
+<script type="text/babel">
+/* global React */
+const { useMemo } = React;
+
+// SVG circuit diagram of a single-phase fully-controlled bridge rectifier.
+// Animates: which thyristor pair is conducting at time t (highlighted),
+// current arrow direction, and shows the load type.
+
+function Thyristor({ x, y, rot = 0, on = false, label }) {
+  // Thyristor symbol: triangle + bar + gate stub
+  // Drawn pointing up by default (anode at top).
+  const color = on ? 'var(--accent)' : 'var(--ink)';
+  const glow = on ? 'drop-shadow(0 0 4px rgba(193,74,26,0.55))' : 'none';
+  return (
+    <g transform={`translate(${x} ${y}) rotate(${rot})`} style={{ filter: glow }}>
+      {/* anode lead */}
+      <line x1="0" y1="-22" x2="0" y2="-10" stroke={color} strokeWidth="1.6" />
+      {/* triangle (anode->cathode pointing down) */}
+      <polygon points="-9,-10 9,-10 0,5" fill={on ? 'var(--accent)' : 'none'} stroke={color} strokeWidth="1.6" strokeLinejoin="round" />
+      {/* cathode bar */}
+      <line x1="-9" y1="5" x2="9" y2="5" stroke={color} strokeWidth="2" />
+      {/* cathode lead */}
+      <line x1="0" y1="5" x2="0" y2="20" stroke={color} strokeWidth="1.6" />
+      {/* gate */}
+      <line x1="9" y1="-2" x2="18" y2="-8" stroke={color} strokeWidth="1.2" />
+      <text x="22" y="-6" fontSize="10" fill="var(--ink-2)" className="mono">{label}</text>
+    </g>
+  );
+}
+
+function CircuitDiagram({ result, tNow }) {
+  const { params, samples } = result;
+  const { alpha, omega, T } = params;
+  const tMod = ((tNow % T) + T) % T;
+  // Determine which pair is conducting at tNow
+  const idx = Math.min(samples.length - 1, Math.round((tMod / T) * (samples.length - 1)));
+  const s = samples[idx];
+  const conducting = Math.abs(s.io) > 1e-4 || s.vo !== 0;
+  // pair sign: positive if vs>0 and conducting, negative if vs<0 and conducting
+  let pairPos = false, pairNeg = false;
+  if (conducting) {
+    if (s.vs >= 0) pairPos = true; else pairNeg = true;
+    // edge case when vs near zero but inductor keeps current going
+    // Use vs sign at firing reference: if tMod between α/ω and (π+α)/ω -> T1T2, else T3T4
+    const omegaT = omega * tMod;
+    const aShifted = (omegaT - alpha + 2 * Math.PI) % (2 * Math.PI);
+    if (aShifted < Math.PI) { pairPos = true; pairNeg = false; }
+    else { pairPos = false; pairNeg = true; }
+  }
+
+  // Layout coordinates
+  // Source on the left, bridge in the middle, load on the right
+  return (
+    <svg viewBox="0 0 520 280" width="100%" style={{ maxHeight: 280 }}>
+      {/* Background grid */}
+      <defs>
+        <pattern id="cgrid" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="var(--rule-2)" strokeWidth="0.5" />
+        </pattern>
+        <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--io)" />
+        </marker>
+      </defs>
+      <rect width="520" height="280" fill="url(#cgrid)" />
+
+      {/* AC source */}
+      <g transform="translate(60 140)">
+        <circle cx="0" cy="0" r="22" fill="var(--panel)" stroke="var(--ink)" strokeWidth="1.6" />
+        <path d="M -12 0 Q -6 -10 0 0 T 12 0" fill="none" stroke="var(--ink)" strokeWidth="1.4" />
+        <text x="0" y="40" fontSize="11" textAnchor="middle" className="mono" fill="var(--ink-2)">vs</text>
+        <text x="0" y="-32" fontSize="10" textAnchor="middle" fill="var(--ink-3)">AC</text>
+      </g>
+
+      {/* Wires from source to bridge nodes A (top) and B (bottom) */}
+      {/* Node A at (220, 80), Node B at (220, 200) */}
+      <line x1="82" y1="140" x2="120" y2="140" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="120" y1="140" x2="120" y2="80" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="120" y1="140" x2="120" y2="200" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="120" y1="80" x2="220" y2="80" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="120" y1="200" x2="220" y2="200" stroke="var(--ink)" strokeWidth="1.6" />
+      <circle cx="220" cy="80" r="2.5" fill="var(--ink)" />
+      <circle cx="220" cy="200" r="2.5" fill="var(--ink)" />
+      <text x="210" y="74" fontSize="10" className="mono" fill="var(--ink-3)" textAnchor="end">A</text>
+      <text x="210" y="216" fontSize="10" className="mono" fill="var(--ink-3)" textAnchor="end">B</text>
+
+      {/* Bridge: 4 thyristors arranged in diamond */}
+      {/* T1: A -> P (top-left -> top-right top rail) */}
+      {/* Top rail P at (340, 60), bottom rail N at (340, 220) */}
+      {/* T1 connects A(220,80) -> P(340,60) — but typical bridge layout: */}
+      {/* We'll lay out as: P-top, A-left, N-bottom, B-right but use convention: */}
+      {/* T1 anode=A, cathode=P;  T2 anode=N, cathode=B;  T3 anode=B, cathode=P;  T4 anode=N, cathode=A */}
+
+      {/* Bridge nodes */}
+      {/* Top rail P (340, 60), Bottom rail N (340, 220) */}
+      {/* We'll draw rails and thyristors between them */}
+      <line x1="280" y1="60" x2="400" y2="60" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="280" y1="220" x2="400" y2="220" stroke="var(--ink)" strokeWidth="1.6" />
+
+      {/* T1: anode at A side (left top going to top rail) */}
+      <line x1="220" y1="80" x2="280" y2="80" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="280" y1="80" x2="280" y2="60" stroke="var(--ink)" strokeWidth="1.6" />
+      {/* Wait — clearer to lay thyristors in slanted lines. Let's redo with cleaner layout */}
+    </svg>
+  );
+}
+
+// Cleaner second attempt — replace the export
+function CircuitDiagramClean({ result, tNow }) {
+  const { params, samples } = result;
+  const { alpha, omega, T, load } = params;
+  const tMod = ((tNow % T) + T) % T;
+  const idx = Math.min(samples.length - 1, Math.round((tMod / T) * (samples.length - 1)));
+  const s = samples[idx];
+
+  // Which pair is conducting?
+  let pair = 'none'; // 'pos' = T1T2, 'neg' = T3T4
+  if (Math.abs(s.io) > 1e-4) {
+    const omegaT = omega * tMod;
+    const aShifted = (omegaT - alpha + 4 * Math.PI) % (2 * Math.PI);
+    pair = aShifted < Math.PI ? 'pos' : 'neg';
+  }
+
+  // Geometry
+  // Source: x≈70, y center 160
+  // Bridge: top node P(320,70), bottom N(320,250), left A(220,160), right B(420,160)
+  // Load: right of bridge, between top rail and bottom rail
+  // Actually conventional bridge: source between A and B (left and right vertical mid-points),
+  // load between P (top) and N (bottom).
+  const P = { x: 320, y: 70 };
+  const N = { x: 320, y: 250 };
+  const A = { x: 220, y: 160 };
+  const B = { x: 420, y: 160 };
+
+  // Thyristors:
+  // T1: A -> P  (conducts on positive half with T2)
+  // T2: N -> B  (conducts on positive half with T1)
+  // T3: B -> P  (conducts on negative half with T4)
+  // T4: N -> A  (conducts on negative half with T3)
+  const T1on = pair === 'pos';
+  const T2on = pair === 'pos';
+  const T3on = pair === 'neg';
+  const T4on = pair === 'neg';
+
+  // Helper to draw a thyristor along a line from p1 to p2
+  function Th({ p1, p2, on, label }) {
+    const mx = (p1.x + p2.x) / 2;
+    const my = (p1.y + p2.y) / 2;
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    // Thyristor pointing from p1 (anode) to p2 (cathode), so rotate so that "down" axis aligns with p1->p2.
+    // Our Thyristor component is drawn with anode at top (y=-22) and cathode at bottom (y=20).
+    // So we need to rotate it so its local +Y points along (dx,dy). Default +Y points down (angle 90°).
+    // Rotation = angle - 90.
+    return (
+      <Thyristor x={mx} y={my} rot={angle - 90} on={on} label={label} />
+    );
+  }
+
+  // Determine output current path color
+  const ioMag = Math.abs(s.io);
+  const ioActive = ioMag > 1e-4;
+
+  return (
+    <svg viewBox="0 0 560 340" width="100%" style={{ maxHeight: 340 }}>
+      <defs>
+        <pattern id="cgrid2" width="20" height="20" patternUnits="userSpaceOnUse">
+          <path d="M 20 0 L 0 0 0 20" fill="none" stroke="var(--rule-2)" strokeWidth="0.5" />
+        </pattern>
+        <marker id="arrI" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--io)" />
+        </marker>
+      </defs>
+      <rect width="560" height="340" fill="url(#cgrid2)" />
+
+      {/* Bridge wires (drawn first, beneath thyristors) */}
+      {/* From A to P (T1 sits on this line), A to N (T4), B to P (T3), B to N (T2) */}
+      <line x1={A.x} y1={A.y} x2={P.x} y2={P.y} stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1={A.x} y1={A.y} x2={N.x} y2={N.y} stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1={B.x} y1={B.y} x2={P.x} y2={P.y} stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1={B.x} y1={B.y} x2={N.x} y2={N.y} stroke="var(--ink)" strokeWidth="1.6" />
+
+      {/* Source on the left */}
+      <line x1="90" y1={A.y} x2={A.x} y2={A.y} stroke="var(--ink)" strokeWidth="1.6" />
+      <g transform={`translate(70 ${A.y})`}>
+        <circle cx="0" cy="0" r="20" fill="var(--panel)" stroke="var(--ink)" strokeWidth="1.6" />
+        <path d="M -10 0 Q -5 -8 0 0 T 10 0" fill="none" stroke="var(--ink)" strokeWidth="1.4" />
+        <text x="-30" y="5" fontSize="12" className="mono" fill="var(--vs)" fontWeight="600">vs</text>
+        <text x="0" y="38" fontSize="10" textAnchor="middle" fill="var(--ink-3)" className="mono">~ Vm sin(ωt)</text>
+      </g>
+      {/* Source 'other terminal' — implicit, the bottom node returns via B side */}
+      {/* Actually for clarity: AC source goes between A and B. Draw a wire from source bottom to B. */}
+      <line x1="70" y1="180" x2="70" y2="270" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="70" y1="270" x2={B.x} y2="270" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1={B.x} y1="270" x2={B.x} y2={B.y} stroke="var(--ink)" strokeWidth="1.6" />
+
+      {/* Connection dots at A and B */}
+      <circle cx={A.x} cy={A.y} r="3" fill="var(--ink)" />
+      <circle cx={B.x} cy={B.y} r="3" fill="var(--ink)" />
+      <circle cx={P.x} cy={P.y} r="3" fill="var(--ink)" />
+      <circle cx={N.x} cy={N.y} r="3" fill="var(--ink)" />
+
+      {/* Thyristors */}
+      <Th p1={A} p2={P} on={T1on} label="T1" />
+      <Th p1={N} p2={B} on={T2on} label="T2" />
+      <Th p1={B} p2={P} on={T3on} label="T3" />
+      <Th p1={N} p2={A} on={T4on} label="T4" />
+
+      {/* Load on the right */}
+      <line x1={P.x} y1={P.y} x2="490" y2={P.y} stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="490" y1={P.y} x2="490" y2="120" stroke="var(--ink)" strokeWidth="1.6" />
+      {/* Load box */}
+      <g transform="translate(465 120)">
+        {/* Resistor (zigzag) */}
+        <path d="M 25 0 L 30 -5 L 40 5 L 50 -5 L 60 5 L 65 0" fill="none" stroke="var(--ink)" strokeWidth="1.6" transform="translate(-20 0) rotate(90) translate(-30 0)" />
+        {/* Easier: vertical resistor zigzag */}
+      </g>
+      {/* Draw load components vertically between (490, 120) and (490, 250) -> wire to N(320,250) */}
+      <ResistorVert x={490} y1={120} y2={170} label={`R = ${result.params.R} Ω`} />
+      {load !== 'R' && <InductorVert x={490} y1={170} y2={210} label={`L = ${result.params.L*1000} mH`} />}
+      {load === 'RLE' && <BatteryVert x={490} y1={210} y2={245} label={`E = ${result.params.E} V`} />}
+      {/* If load is just R, fill the gap with wire */}
+      {load === 'R' && <line x1="490" y1="170" x2="490" y2="245" stroke="var(--ink)" strokeWidth="1.6" />}
+      {load === 'RL' && <line x1="490" y1="210" x2="490" y2="245" stroke="var(--ink)" strokeWidth="1.6" />}
+      {/* Return wire from load bottom to N */}
+      <line x1="490" y1="245" x2="490" y2="290" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1="490" y1="290" x2={N.x} y2="290" stroke="var(--ink)" strokeWidth="1.6" />
+      <line x1={N.x} y1="290" x2={N.x} y2={N.y} stroke="var(--ink)" strokeWidth="1.6" />
+
+      {/* Vo label across load (between top rail and bottom rail) */}
+      <g>
+        <line x1="450" y1={P.y} x2="450" y2={N.y} stroke="var(--vo)" strokeDasharray="3 3" strokeWidth="1" opacity="0.8" />
+        <text x="446" y={(P.y + N.y) / 2} fontSize="13" textAnchor="end" className="mono" fill="var(--vo)" fontWeight="600">+ vo −</text>
+      </g>
+
+      {/* Io arrow on the top rail to the load */}
+      <g opacity={ioActive ? 1 : 0.25}>
+        <line x1="370" y1={P.y - 14} x2="430" y2={P.y - 14} stroke="var(--io)" strokeWidth="1.8" markerEnd="url(#arrI)" />
+        <text x="400" y={P.y - 20} fontSize="12" textAnchor="middle" className="mono" fill="var(--io)" fontWeight="600">io</text>
+      </g>
+
+      {/* Live readout */}
+      <g transform="translate(20 320)">
+        <text x="0" y="0" fontSize="10" className="mono" fill="var(--ink-3)">
+          ωt = {((omega * tMod) * 180 / Math.PI).toFixed(0)}°  ·  vs = {s.vs.toFixed(1)} V  ·  vo = {s.vo.toFixed(1)} V  ·  io = {s.io.toFixed(2)} A  ·  conducting: <tspan fill="var(--accent)" fontWeight="600">{pair === 'pos' ? 'T1 + T2' : pair === 'neg' ? 'T3 + T4' : '—'}</tspan>
+        </text>
+      </g>
+    </svg>
+  );
+}
+
+function ResistorVert({ x, y1, y2, label }) {
+  // Vertical zigzag resistor from (x, y1) to (x, y2)
+  const segs = 6;
+  const dy = (y2 - y1) / segs;
+  let path = `M ${x} ${y1}`;
+  for (let i = 0; i < segs; i++) {
+    const dx = i % 2 === 0 ? 7 : -7;
+    path += ` L ${x + dx} ${y1 + dy * (i + 0.5)}`;
+  }
+  path += ` L ${x} ${y2}`;
+  return (
+    <g>
+      <path d={path} fill="none" stroke="var(--ink)" strokeWidth="1.6" />
+      <text x={x + 14} y={(y1 + y2) / 2 + 4} fontSize="10" className="mono" fill="var(--ink-2)">{label}</text>
+    </g>
+  );
+}
+function InductorVert({ x, y1, y2, label }) {
+  // Vertical inductor: series of small arcs
+  const coils = 4;
+  const dy = (y2 - y1) / coils;
+  const r = dy / 2;
+  let path = `M ${x} ${y1}`;
+  for (let i = 0; i < coils; i++) {
+    const cy1 = y1 + i * dy;
+    const cy2 = y1 + (i + 1) * dy;
+    path += ` A ${r} ${r} 0 0 1 ${x} ${cy2}`;
+  }
+  return (
+    <g>
+      <path d={path} fill="none" stroke="var(--ink)" strokeWidth="1.6" />
+      <text x={x + 14} y={(y1 + y2) / 2 + 4} fontSize="10" className="mono" fill="var(--ink-2)">{label}</text>
+    </g>
+  );
+}
+function BatteryVert({ x, y1, y2, label }) {
+  const mid = (y1 + y2) / 2;
+  return (
+    <g>
+      <line x1={x} y1={y1} x2={x} y2={mid - 6} stroke="var(--ink)" strokeWidth="1.6" />
+      {/* long plate (+) on top */}
+      <line x1={x - 10} y1={mid - 6} x2={x + 10} y2={mid - 6} stroke="var(--ink)" strokeWidth="2" />
+      {/* short plate (-) below */}
+      <line x1={x - 5} y1={mid + 2} x2={x + 5} y2={mid + 2} stroke="var(--ink)" strokeWidth="2" />
+      <line x1={x} y1={mid + 2} x2={x} y2={y2} stroke="var(--ink)" strokeWidth="1.6" />
+      <text x={x + 14} y={mid + 4} fontSize="10" className="mono" fill="var(--ink-2)">{label}</text>
+    </g>
+  );
+}
+
+Object.assign(window, { CircuitDiagram: CircuitDiagramClean, Thyristor });
+
+</script>
+<script type="text/babel">
+/* global React */
+const useMemo = React.useMemo;
+
+// Waveform plot — three stacked axes (vs, vo, io), shared x in degrees of ωt.
+// Renders as SVG. A moving cursor line indicates the current time.
+
+function WaveformPlot({ result, tNow, periods = 2 }) {
+  const { samples, params } = result;
+  const { T, omega, Vm } = params;
+  const totalT = T * periods;
+
+  // Build extended sample array across N periods
+  const extended = useMemo(() => {
+    const N = samples.length - 1;
+    const arr = [];
+    for (let p = 0; p < periods; p++) {
+      for (let k = 0; k < N; k++) {
+        const s = samples[k];
+        arr.push({ t: s.t + p * T, vs: s.vs, vo: s.vo, io: s.io });
+      }
+    }
+    // last point
+    const last = samples[N];
+    arr.push({ t: last.t + (periods - 1) * T, vs: last.vs, vo: last.vo, io: last.io });
+    return arr;
+  }, [samples, periods, T]);
+
+  // Bounds
+  const vMax = Math.max(Vm, ...extended.map(p => Math.max(Math.abs(p.vs), Math.abs(p.vo)))) * 1.1;
+  const iMax = Math.max(0.01, ...extended.map(p => Math.abs(p.io))) * 1.15;
+
+  // SVG geometry
+  const W = 640;
+  const H = 360;
+  const padL = 56, padR = 16, padT = 18, padB = 28;
+  const plotW = W - padL - padR;
+  const rowH = (H - padT - padB) / 3;
+  const gap = 8;
+
+  const xOf = (t) => padL + (t / totalT) * plotW;
+  const yOfRow = (row) => padT + row * rowH;
+
+  // y-scalers
+  const yV = (v, row) => yOfRow(row) + (rowH - gap) / 2 - (v / vMax) * ((rowH - gap) / 2);
+  const yI = (i, row) => yOfRow(row) + (rowH - gap) / 2 - (i / iMax) * ((rowH - gap) / 2);
+
+  // Build paths
+  const pathVs = useMemo(() => {
+    let d = '';
+    for (let k = 0; k < extended.length; k++) {
+      const p = extended[k];
+      d += (k === 0 ? 'M' : 'L') + xOf(p.t) + ',' + yV(p.vs, 0);
+    }
+    return d;
+  }, [extended]);
+  const pathVo = useMemo(() => {
+    let d = '';
+    for (let k = 0; k < extended.length; k++) {
+      const p = extended[k];
+      d += (k === 0 ? 'M' : 'L') + xOf(p.t) + ',' + yV(p.vo, 1);
+    }
+    return d;
+  }, [extended]);
+  const pathIo = useMemo(() => {
+    let d = '';
+    for (let k = 0; k < extended.length; k++) {
+      const p = extended[k];
+      d += (k === 0 ? 'M' : 'L') + xOf(p.t) + ',' + yI(p.io, 2);
+    }
+    return d;
+  }, [extended]);
+
+  // Fill area under vo (shows rectified energy) and under io
+  const fillVo = useMemo(() => {
+    let d = '';
+    const baseY = yV(0, 1);
+    for (let k = 0; k < extended.length; k++) {
+      const p = extended[k];
+      d += (k === 0 ? 'M' : 'L') + xOf(p.t) + ',' + yV(p.vo, 1);
+    }
+    d += ` L ${xOf(extended[extended.length - 1].t)},${baseY} L ${xOf(extended[0].t)},${baseY} Z`;
+    return d;
+  }, [extended]);
+  const fillIo = useMemo(() => {
+    let d = '';
+    const baseY = yI(0, 2);
+    for (let k = 0; k < extended.length; k++) {
+      const p = extended[k];
+      d += (k === 0 ? 'M' : 'L') + xOf(p.t) + ',' + yI(p.io, 2);
+    }
+    d += ` L ${xOf(extended[extended.length - 1].t)},${baseY} L ${xOf(extended[0].t)},${baseY} Z`;
+    return d;
+  }, [extended]);
+
+  // X gridlines every 30° = T/12
+  const xTicks = [];
+  for (let p = 0; p <= periods; p++) {
+    for (let deg = 0; deg < 360; deg += 60) {
+      const t = p * T + (deg / 360) * T;
+      if (t > totalT + 1e-9) break;
+      xTicks.push({ t, deg: p * 360 + deg });
+    }
+  }
+  xTicks.push({ t: totalT, deg: periods * 360 });
+
+  // Firing instants
+  const firing = [];
+  for (let p = 0; p < periods; p++) {
+    firing.push(p * T + (params.alpha / omega));
+    firing.push(p * T + (Math.PI + params.alpha) / omega);
+  }
+
+  // Cursor at tNow
+  const tCursor = ((tNow % totalT) + totalT) % totalT;
+
+  const rows = [
+    { label: 'vs (V)', color: 'var(--vs)', y0: yV(0, 0), max: vMax },
+    { label: 'vo (V)', color: 'var(--vo)', y0: yV(0, 1), max: vMax },
+    { label: 'io (A)', color: 'var(--io)', y0: yI(0, 2), max: iMax },
+  ];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" style={{ display: 'block' }}>
+      {/* Row backgrounds */}
+      {rows.map((r, i) => (
+        <rect key={i} x={padL} y={yOfRow(i)} width={plotW} height={rowH - gap} fill="var(--panel)" stroke="var(--rule)" strokeWidth="0.5" />
+      ))}
+
+      {/* X gridlines */}
+      {xTicks.map((tk, i) => (
+        <g key={i}>
+          {rows.map((r, ri) => (
+            <line key={ri} x1={xOf(tk.t)} y1={yOfRow(ri)} x2={xOf(tk.t)} y2={yOfRow(ri) + rowH - gap} stroke="var(--grid)" strokeWidth="0.5" />
+          ))}
+          <text x={xOf(tk.t)} y={H - padB + 14} fontSize="9" textAnchor="middle" className="mono" fill="var(--ink-3)">
+            {tk.deg}°
+          </text>
+        </g>
+      ))}
+
+      {/* Zero axes */}
+      {rows.map((r, i) => (
+        <line key={i} x1={padL} y1={r.y0} x2={W - padR} y2={r.y0} stroke="var(--grid-axis)" strokeWidth="0.6" />
+      ))}
+
+      {/* Firing instant vertical lines */}
+      {firing.map((tf, i) => (
+        <g key={i}>
+          {rows.map((r, ri) => (
+            <line key={ri} x1={xOf(tf)} y1={yOfRow(ri)} x2={xOf(tf)} y2={yOfRow(ri) + rowH - gap} stroke="var(--accent)" strokeDasharray="2 3" strokeWidth="0.8" opacity="0.55" />
+          ))}
+        </g>
+      ))}
+
+      {/* Fills */}
+      <path d={fillVo} fill="var(--vo)" opacity="0.12" />
+      <path d={fillIo} fill="var(--io)" opacity="0.12" />
+
+      {/* Traces */}
+      <path d={pathVs} fill="none" stroke="var(--vs)" strokeWidth="1.8" />
+      <path d={pathVo} fill="none" stroke="var(--vo)" strokeWidth="1.8" />
+      <path d={pathIo} fill="none" stroke="var(--io)" strokeWidth="1.8" />
+
+      {/* Cursor */}
+      {rows.map((r, i) => (
+        <line key={i} x1={xOf(tCursor)} y1={yOfRow(i)} x2={xOf(tCursor)} y2={yOfRow(i) + rowH - gap} stroke="var(--ink)" strokeWidth="0.8" opacity="0.55" />
+      ))}
+
+      {/* Y labels & scale */}
+      {rows.map((r, i) => (
+        <g key={i}>
+          <text x={padL - 8} y={yOfRow(i) + 12} fontSize="11" textAnchor="end" className="mono" fill={r.color} fontWeight="600">{r.label}</text>
+          <text x={padL - 8} y={yOfRow(i) + (rowH - gap) / 2 + 4} fontSize="9" textAnchor="end" className="mono" fill="var(--ink-3)">0</text>
+          <text x={padL - 8} y={yOfRow(i) + 22 + 4} fontSize="9" textAnchor="end" className="mono" fill="var(--ink-3)">+{r.max.toFixed(r.max < 5 ? 2 : 0)}</text>
+          <text x={padL - 8} y={yOfRow(i) + rowH - gap - 6} fontSize="9" textAnchor="end" className="mono" fill="var(--ink-3)">−{r.max.toFixed(r.max < 5 ? 2 : 0)}</text>
+        </g>
+      ))}
+
+      {/* X axis label */}
+      <text x={W / 2} y={H - 2} fontSize="10" textAnchor="middle" className="mono" fill="var(--ink-3)">ωt (degrees)</text>
+    </svg>
+  );
+}
+
+Object.assign(window, { WaveformPlot });
+
+</script>
+<script type="text/babel">
+/* global React */
+const { useState: _useStateC } = React;
+
+function Field({ label, unit, children, hint }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+        <span style={{ fontSize: 11, color: 'var(--ink-2)', fontWeight: 500, letterSpacing: 0.2, textTransform: 'uppercase' }}>{label}</span>
+        {unit && <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>{unit}</span>}
+      </div>
+      {children}
+      {hint && <span style={{ fontSize: 10, color: 'var(--ink-3)' }}>{hint}</span>}
+    </div>
+  );
+}
+
+function Slider({ value, min, max, step, onChange, suffix }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        style={{ flex: 1, accentColor: 'var(--accent)' }}
+      />
+      <span className="mono" style={{ minWidth: 72, textAlign: 'right', fontSize: 12, fontWeight: 600 }}>
+        {Number.isInteger(step) ? value : value.toFixed(step >= 1 ? 0 : -Math.log10(step))}{suffix ? ' ' + suffix : ''}
+      </span>
+    </div>
+  );
+}
+
+function Segmented({ value, options, onChange }) {
+  return (
+    <div style={{
+      display: 'inline-flex', background: 'var(--bg)',
+      border: '1px solid var(--rule)', borderRadius: 6, padding: 2,
+    }}>
+      {options.map((opt) => (
+        <button
+          key={opt.value}
+          onClick={() => onChange(opt.value)}
+          style={{
+            border: 'none', cursor: 'pointer',
+            padding: '6px 12px', borderRadius: 4,
+            background: value === opt.value ? 'var(--panel)' : 'transparent',
+            color: value === opt.value ? 'var(--ink)' : 'var(--ink-2)',
+            boxShadow: value === opt.value ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+            fontWeight: value === opt.value ? 600 : 500,
+            fontSize: 12,
+            fontFamily: 'inherit',
+            transition: 'all 120ms',
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Controls({ state, set }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <Field label="Load type">
+        <Segmented
+          value={state.load}
+          onChange={(v) => set({ load: v })}
+          options={[
+            { value: 'R', label: 'R' },
+            { value: 'RL', label: 'R + L' },
+            { value: 'RLE', label: 'R + L + E' },
+          ]}
+        />
+      </Field>
+
+      <Field label="Firing angle α" unit="degrees">
+        <Slider value={state.alphaDeg} min={0} max={180} step={1} onChange={(v) => set({ alphaDeg: v })} suffix="°" />
+      </Field>
+
+      <Field label="Peak source voltage Vm" unit="volts">
+        <Slider value={state.Vm} min={10} max={400} step={1} onChange={(v) => set({ Vm: v })} suffix="V" />
+      </Field>
+
+      <Field label="Line frequency f" unit="hertz">
+        <Slider value={state.f} min={20} max={400} step={1} onChange={(v) => set({ f: v })} suffix="Hz" />
+      </Field>
+
+      <Field label="Resistance R" unit="ohms">
+        <Slider value={state.R} min={0.5} max={100} step={0.5} onChange={(v) => set({ R: v })} suffix="Ω" />
+      </Field>
+
+      {state.load !== 'R' && (
+        <Field label="Inductance L" unit="millihenries">
+          <Slider value={state.L * 1000} min={1} max={500} step={1} onChange={(v) => set({ L: v / 1000 })} suffix="mH" />
+        </Field>
+      )}
+
+      {state.load === 'RLE' && (
+        <Field label="Back-EMF E" unit="volts" hint="DC motor armature or battery emf">
+          <Slider value={state.E} min={-200} max={200} step={1} onChange={(v) => set({ E: v })} suffix="V" />
+        </Field>
+      )}
+    </div>
+  );
+}
+
+Object.assign(window, { Controls, Field });
+
+</script>
+<script type="text/babel">
+/* global React, ReactDOM, RectifierSim, CircuitDiagram, WaveformPlot, Controls */
+const { useState, useEffect, useRef, useMemo } = React;
+
+function Metric({ label, value, unit, color }) {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', gap: 2,
+      padding: '10px 12px', background: 'var(--panel)',
+      border: '1px solid var(--rule)', borderRadius: 6, minWidth: 110,
+    }}>
+      <div style={{ fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: 0.4, fontWeight: 600 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 18, fontWeight: 600, color: color || 'var(--ink)' }}>
+        {value}<span style={{ fontSize: 11, color: 'var(--ink-3)', marginLeft: 3, fontWeight: 500 }}>{unit}</span>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [state, setState] = useState({
+    load: 'RL',
+    alphaDeg: 30,
+    Vm: 170,        // ~120 Vrms peak
+    f: 50,
+    R: 10,
+    L: 0.05,
+    E: 0,
+  });
+  const set = (patch) => setState((s) => ({ ...s, ...patch }));
+
+  const [playing, setPlaying] = useState(true);
+  const [speed, setSpeed] = useState(1);   // playback speed (1 = real time / slowed)
+  const [tNow, setTNow] = useState(0);
+  const rafRef = useRef(0);
+  const lastRef = useRef(performance.now());
+
+  const result = useMemo(() => RectifierSim.simulate(state), [state]);
+
+  useEffect(() => {
+    function frame(now) {
+      const dt = (now - lastRef.current) / 1000;
+      lastRef.current = now;
+      if (playing) {
+        // Slow time by factor: real seconds → simulated seconds.
+        // At 50 Hz, real-time = 20 ms per period — too fast to see. Use 1/30 slowdown by default.
+        const slowdown = 30 / speed;
+        setTNow((t) => t + dt / slowdown);
+      }
+      rafRef.current = requestAnimationFrame(frame);
+    }
+    rafRef.current = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [playing, speed]);
+
+  const m = result.metrics;
+
+  return (
+    <div style={{ maxWidth: 1320, margin: '0 auto', padding: '24px 28px 60px' }}>
+      {/* Header */}
+      <header style={{
+        display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between',
+        paddingBottom: 16, borderBottom: '1px solid var(--rule)', marginBottom: 22, gap: 16,
+      }}>
+        <div>
+          <div style={{ fontSize: 11, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: 1.6, fontWeight: 600 }}>Power Electronics · Lab Bench</div>
+          <h1 style={{ margin: '4px 0 0', fontSize: 28, fontWeight: 700, letterSpacing: -0.4 }}>
+            Single-Phase Full-Wave Controlled Rectifier
+          </h1>
+          <div style={{ marginTop: 4, fontSize: 13, color: 'var(--ink-2)' }}>
+            Adjust the firing angle and load to see how <span style={{ color: 'var(--vs)', fontWeight: 600 }}>vs</span>, <span style={{ color: 'var(--vo)', fontWeight: 600 }}>vo</span>, and <span style={{ color: 'var(--io)', fontWeight: 600 }}>io</span> respond.
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            onClick={() => setPlaying((p) => !p)}
+            style={{
+              border: '1px solid var(--rule)', background: 'var(--panel)',
+              padding: '8px 14px', borderRadius: 6, cursor: 'pointer',
+              fontFamily: 'inherit', fontSize: 13, fontWeight: 600,
+              color: playing ? 'var(--accent)' : 'var(--ink)',
+            }}
+          >{playing ? '❚❚ Pause' : '▶ Play'}</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--ink-3)' }} className="mono">SPEED</span>
+            <input type="range" min={0.25} max={4} step={0.25} value={speed} onChange={(e) => setSpeed(parseFloat(e.target.value))} style={{ width: 90, accentColor: 'var(--accent)' }} />
+            <span className="mono" style={{ fontSize: 12, minWidth: 36 }}>{speed.toFixed(2)}×</span>
+          </div>
+        </div>
+      </header>
+
+      {/* Main grid */}
+      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 22 }}>
+        {/* LEFT — controls */}
+        <aside style={{
+          background: 'var(--panel)', border: '1px solid var(--rule)', borderRadius: 10,
+          padding: '20px 20px 24px',
+          height: 'fit-content', position: 'sticky', top: 18,
+        }}>
+          <div style={{ fontSize: 11, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: 1, fontWeight: 700, marginBottom: 14 }}>Controls</div>
+          <Controls state={state} set={set} />
+        </aside>
+
+        {/* RIGHT — circuit + plot + metrics */}
+        <main style={{ display: 'flex', flexDirection: 'column', gap: 18, minWidth: 0 }}>
+          {/* Circuit */}
+          <section style={{ background: 'var(--panel)', border: '1px solid var(--rule)', borderRadius: 10, padding: 16 }}>
+            <SectionTitle eyebrow="Circuit" title="Bridge with thyristors T1–T4" />
+            <CircuitDiagram result={result} tNow={tNow} />
+          </section>
+
+          {/* Waveforms */}
+          <section style={{ background: 'var(--panel)', border: '1px solid var(--rule)', borderRadius: 10, padding: '16px 16px 8px' }}>
+            <SectionTitle eyebrow="Waveforms" title="Source · output · load current" right={
+              <div style={{ display: 'flex', gap: 14, fontSize: 11 }} className="mono">
+                <LegendDot color="var(--vs)" label="vs" />
+                <LegendDot color="var(--vo)" label="vo" />
+                <LegendDot color="var(--io)" label="io" />
+                <span style={{ color: 'var(--ink-3)' }}>α-lines dashed</span>
+              </div>
+            } />
+            <WaveformPlot result={result} tNow={tNow} periods={2} />
+          </section>
+
+          {/* Metrics */}
+          <section>
+            <SectionTitle eyebrow="Steady-state" title="Measured at the load" />
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, marginTop: 8 }}>
+              <Metric label="Vo avg"    value={m.Vavg.toFixed(2)} unit="V" color="var(--vo)" />
+              <Metric label="Vo rms"    value={m.Vrms.toFixed(2)} unit="V" color="var(--vo)" />
+              <Metric label="Io avg"    value={m.Iavg.toFixed(3)} unit="A" color="var(--io)" />
+              <Metric label="Io rms"    value={m.Irms.toFixed(3)} unit="A" color="var(--io)" />
+              <Metric label="Ripple"    value={(m.ripplePct).toFixed(1)} unit="%" />
+              <Metric label="γ cond."   value={m.conductionAngleDeg.toFixed(0)} unit="°" />
+              <Metric label="Vo theory (CCM)" value={m.VavgTheory.toFixed(2)} unit="V" />
+            </div>
+            <div style={{ marginTop: 10, fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.6 }}>
+              For continuous conduction: V<sub>o,avg</sub> = (2·V<sub>m</sub>/π)·cos(α). The simulator integrates the actual differential equation so values may differ from theory when conduction is discontinuous (small L, large α, or large E).
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function SectionTitle({ eyebrow, title, right }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 10 }}>
+      <div>
+        <div style={{ fontSize: 10, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: 1.4, fontWeight: 700 }}>{eyebrow}</div>
+        <div style={{ fontSize: 15, fontWeight: 600, marginTop: 2 }}>{title}</div>
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function LegendDot({ color, label }) {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+      <span style={{ width: 10, height: 3, background: color, borderRadius: 1 }} />
+      <span style={{ color: 'var(--ink-2)', fontWeight: 600 }}>{label}</span>
+    </span>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+</script>
+</body>
+</html>
